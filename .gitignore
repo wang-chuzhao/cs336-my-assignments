@@ -10,3 +10,5 @@ assignment1-basics/data/
 assignment1-basics/logs/
 assignment2-systems/job-logs/
 assignment2-systems/_cluster_*
+*.nsys-rep
+*.sqlite

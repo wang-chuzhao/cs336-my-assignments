@@ -16,6 +16,10 @@ class FSDP(nn.Module):
         self.origin_dtype=None
         self.fp32_shard={}
 
+        self.units=[] # [emb, lin1, lin2, ...]
+        self.units_ready=False
+        self.inflights={} # id(module) -> (handle, full)
+
         hooked=set()
 
         for name,mod in self.module.named_modules():
@@ -42,44 +46,66 @@ class FSDP(nn.Module):
                     p.data=new_weight.clone()
                     mod.register_forward_pre_hook(self.fwd_pre)
                     mod.register_forward_hook(self.fwd_post)
+                    if isinstance(mod,Linear):
+                        mod.register_full_backward_pre_hook(self.bwd_pre)
 
-                    p.register_post_accumulate_grad_hook(self.sharded_grad_hook)
-                    #id(p)表示p的内存地址整数，唯一标识
-                    hooked.add(id(p))
-
-                    mod.register_full_backward_pre_hook(self.bwd_pre)
+                    if id(p) not in hooked:
+                        p.register_post_accumulate_grad_hook(self.sharded_grad_hook)
+                        hooked.add(id(p))
 
         for mod in self.module.modules():
             for p in mod.parameters(recurse=False):
                 if p.requires_grad and id(p) not in hooked:
                     p.register_post_accumulate_grad_hook(self.full_grad_hook)
 
+    def _next_unit(self,module):
+        i=self.units.index(module)
+        return self.units[i+1] if i+1<len(self.units) else None
 
-    def fwd_pre(self,module,*args):
+    def _start_unshard(self,module):
+        if id(module) in self.inflights:
+            return
         shard=module.weight.data
         self.fp32_shard[id(module.weight)]=shard.clone()
-
         if self.compute_dtype is not None:
             shard=shard.to(self.compute_dtype)
         shape=shard.shape
         full_length=shape[0]*self.world_size
         output=torch.empty((full_length,shape[1]),dtype=shard.dtype,device=shard.device)
-        dist.all_gather_into_tensor(output,shard.contiguous())
+        handle=dist.all_gather_into_tensor(output,shard.contiguous(),async_op=True)
+        self.inflights[id(module)]=(handle,output)
+
+    def fwd_pre(self,module,*args):
+        if not self.units_ready:
+            self.units.append(module)
+
+        if id(module) not in self.inflights:#第一层
+            self._start_unshard(module)
+        handle,output=self.inflights.pop(id(module))
+        handle.wait()
         module.weight.data=output
+
+        if self.units_ready:
+            next_unit=self._next_unit(module)
+            if next_unit is not None:
+                self._start_unshard(next_unit)
 
     def fwd_post(self,module,*args):
         module.weight.data=self.fp32_shard[id(module.weight)]
 
+    def _pre_unit(self,module):
+        i=self.units.index(module)
+        return self.units[i-1] if i-1>=0 else None
+
     def bwd_pre(self,module,*args):
-        shard=module.weight.data
-        self.fp32_shard[id(module.weight)]=shard.clone()
-        if self.compute_dtype is not None:
-            shard=shard.to(self.compute_dtype)
-        shape=shard.shape
-        full_length=shape[0]*self.world_size
-        output=torch.empty((full_length,shape[1]),dtype=shard.dtype,device=shard.device)
-        dist.all_gather_into_tensor(output,shard.contiguous())
+        if id(module) not in self.inflights:
+            self._start_unshard(module)
+        handle,output=self.inflights.pop(id(module))
+        handle.wait()
         module.weight.data=output
+        prev_unit=self._pre_unit(module)
+        if isinstance(prev_unit,Linear):
+            self._start_unshard(prev_unit)
 
     def sharded_grad_hook(self,param):
         #此时Linear是bwd_pre后的full_shape，但是Embedding仍然是分片的
@@ -92,21 +118,13 @@ class FSDP(nn.Module):
         #先处理Linear的分片
         if param.data.shape[0]==full_shape[0]:
             param.data=self.fp32_shard.pop(id(param))
-        #grad的shape和weight的shape是一致的，所以Linear是reduce_scatter(SUM)
-        #Embedding是all_reduce(SUM)操作，可以切分为all_gather+reduce_scatter
-        if part_length==param.grad.data.shape[0]:
-            shard=param.grad.data
-            output=torch.empty(full_shape,dtype=shard.dtype,device=shard.device)
-            dist.all_gather_into_tensor(output,shard.contiguous())
-            param.grad.data=output
 
-        #此时两种模块的grad都是full_shape的了
-        full_grad=param.grad.data/self.world_size
+        #两种模块的grad都是full_shape，因为grad的shape和fwd时记录的weight的shape是一致的
+        full_grad=param.grad.data.to(self.origin_dtype)/self.world_size
         output=torch.empty((part_length,full_shape[1]),dtype=full_grad.dtype,device=full_grad.device)
-        dist.reduce_scatter_tensor(output,full_grad.contiguous(),op=dist.ReduceOp.SUM)
-        if self.compute_dtype is not None:
-            output=output.to(self.origin_dtype)
-        #使用.data的话，形状不同会报错
+        handle=dist.reduce_scatter_tensor(output,full_grad.contiguous(),op=dist.ReduceOp.SUM,async_op=True)
+        self.grad_handles.append(handle)
+        #最终操作的是output的内存，异步操作不影响最终结果
         param.grad=output
 
     def full_grad_hook(self,param):
@@ -115,7 +133,10 @@ class FSDP(nn.Module):
         self.grad_handles.append(handle)
 
     def forward(self,*args,**kwargs):
-        return self.module(*args,**kwargs)
+        output=self.module(*args,**kwargs)
+        if not self.units_ready:
+            self.units_ready=True
+        return output
 
     def finish_gradient_synchronization(self):
         for handle in self.grad_handles:
